@@ -67,6 +67,47 @@ Example:
 SERVER_ID=lk1 REDIS_ADDR=10.0.0.5:6379 REDIS_PASSWORD=secret ./server-stats
 ```
 
+## Running in the background (systemd)
+
+The terminal dashboard only makes sense in an open SSH session — for
+publishing to Redis continuously, run it as a systemd service instead so it
+survives disconnects, reboots, and crashes. A unit file is included
+(`server-stats.service`):
+
+```sh
+# On the box, as root:
+mkdir -p /opt/server-stats
+scp server-stats you@host:/opt/server-stats/server-stats   # or build directly on the box
+scp server-stats.service /etc/systemd/system/server-stats.service
+
+# Env vars go in a separate file the unit reads via EnvironmentFile —
+# keeps secrets (REDIS_PASSWORD) out of `systemctl status`/process listings.
+cat > /opt/server-stats/server-stats.env << 'EOF'
+SERVER_ID=lk1
+REDIS_ADDR=10.0.0.5:6379
+REDIS_PASSWORD=secret
+EOF
+chmod 600 /opt/server-stats/server-stats.env
+chmod +x /opt/server-stats/server-stats
+
+systemctl daemon-reload
+systemctl enable --now server-stats
+```
+
+Check on it:
+
+```sh
+systemctl status server-stats     # running? recent restarts?
+journalctl -u server-stats -f     # live output, same as the terminal dashboard
+```
+
+The unit runs as `nobody` (this tool only reads `/proc`, `/sys/class/net`,
+and shells out to `df` — nothing here needs root) and restarts automatically
+on crash. To stop publishing without removing anything, edit
+`server-stats.env`, comment out `SERVER_ID`/`REDIS_ADDR`, and
+`systemctl restart server-stats` — the terminal-dashboard behavior (now
+just going to the journal instead of a terminal) keeps running either way.
+
 ## What "port speed" means here
 
 `IN utilization` / `OUT utilization` are current throughput as a percentage
@@ -75,3 +116,5 @@ LiveKit's media traffic is approaching the box's actual uplink capacity,
 distinct from CPU/RAM pressure. The scaling-signal section at the bottom
 flags when two or more of CPU/RAM/network-out/disk cross a warning
 threshold, as a rough "consider adding another LiveKit node" nudge.
+
+# good

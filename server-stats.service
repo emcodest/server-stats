@@ -1,0 +1,23 @@
+[Unit]
+Description=server-stats — LiveKit box monitor (terminal dashboard + Redis publisher)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/server-stats/server-stats
+EnvironmentFile=/opt/server-stats/server-stats.env
+Restart=always
+RestartSec=5
+# No terminal attached under systemd, so the clear-screen/refresh loop just
+# writes to the journal each tick — fine, nobody reads it interactively here.
+StandardOutput=journal
+StandardError=journal
+# Reads /proc, /sys/class/net, and runs `df` — no elevated privileges needed.
+User=nobody
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadOnlyPaths=/opt/server-stats
+
+[Install]
+WantedBy=multi-user.target
