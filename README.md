@@ -37,6 +37,36 @@ Example:
 NETWORK_IF=eth0 PORT_SPEED_GBPS=2 ./server-stats
 ```
 
+## Redis publishing (for the Vapp admin dashboard)
+
+Set both `SERVER_ID` and `REDIS_ADDR` to also publish each snapshot to
+Redis, on top of the terminal dashboard (which keeps running exactly as
+before — publishing is additive, not a replacement). Leave either unset
+and nothing is published; the tool behaves exactly as it does today.
+
+| Var               | Default    | Notes                                                                 |
+| ------------------ | ---------- | ---------------------------------------------------------------------- |
+| `SERVER_ID`         | *(unset)*  | Label this box publishes under, e.g. `lk1`, `lk2` — shows up as-is in the admin dashboard. Required to publish. |
+| `REDIS_ADDR`        | *(unset)*  | `host:port` of the same Redis instance vapp-api uses. Required to publish. |
+| `REDIS_PASSWORD`    | *(unset)*  | Optional. |
+
+Each tick, a JSON snapshot is written to `vapp:livekit:stats:<SERVER_ID>`
+with a TTL of `5 * INTERVAL_SECONDS` (minimum 15s) — so a box that stops
+publishing (crashed, network partition, stopped) simply drops out of the
+admin dashboard once its key expires, with nothing to manually deregister.
+Adding a new LiveKit box is just: run this binary on it with a unique
+`SERVER_ID` pointed at the same Redis — the dashboard picks it up on its
+own.
+
+A Redis error is logged and never fatal — publishing failing must never
+take down the terminal monitor.
+
+Example:
+
+```sh
+SERVER_ID=lk1 REDIS_ADDR=10.0.0.5:6379 REDIS_PASSWORD=secret ./server-stats
+```
+
 ## What "port speed" means here
 
 `IN utilization` / `OUT utilization` are current throughput as a percentage

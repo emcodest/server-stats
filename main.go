@@ -2,7 +2,10 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"strconv"
@@ -10,6 +13,7 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -28,6 +32,11 @@ func init() {
 //	PORT_SPEED_GBPS   used only if the NIC doesn't report its own link
 //	                   speed (common on virtualized/cloud NICs)
 //	INTERVAL_SECONDS  refresh interval
+//	SERVER_ID         label this box publishes under, e.g. "lk1" — unset
+//	                   means "don't publish", so this stays a pure
+//	                   terminal dashboard exactly like before
+//	REDIS_ADDR        host:port of the shared Redis to publish stats to
+//	REDIS_PASSWORD    optional
 func loadConfig() (iface string, portSpeedGbps float64, interval time.Duration) {
 	iface = os.Getenv("NETWORK_IF")
 
@@ -46,6 +55,22 @@ func loadConfig() (iface string, portSpeedGbps float64, interval time.Duration) 
 	}
 
 	return
+}
+
+// publishConfig is read once at startup — if ServerID or RedisAddr is
+// empty, publishing is skipped entirely and the loop below is a no-op.
+type publishConfig struct {
+	ServerID      string
+	RedisAddr     string
+	RedisPassword string
+}
+
+func loadPublishConfig() publishConfig {
+	return publishConfig{
+		ServerID:      os.Getenv("SERVER_ID"),
+		RedisAddr:     os.Getenv("REDIS_ADDR"),
+		RedisPassword: os.Getenv("REDIS_PASSWORD"),
+	}
 }
 
 type NetStats struct {
@@ -361,6 +386,91 @@ func clearScreen() {
 	fmt.Print("\033[H\033[2J")
 }
 
+// snapshot is the JSON shape published to Redis — every field is already
+// computed by the terminal-print loop in main() below; this just carries
+// the same numbers out over the wire instead of (also) printing them.
+type snapshot struct {
+	ServerID       string    `json:"server_id"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	Interface      string    `json:"interface"`
+	CPUPercent     float64   `json:"cpu_percent"`
+	Load1          float64   `json:"load1"`
+	Load5          float64   `json:"load5"`
+	Load15         float64   `json:"load15"`
+	MemUsedBytes   uint64    `json:"mem_used_bytes"`
+	MemTotalBytes  uint64    `json:"mem_total_bytes"`
+	MemPercent     float64   `json:"mem_percent"`
+	NetInMbps      float64   `json:"net_in_mbps"`
+	NetOutMbps     float64   `json:"net_out_mbps"`
+	NetInUtilPct   float64   `json:"net_in_util_pct"`
+	NetOutUtilPct  float64   `json:"net_out_util_pct"`
+	PortSpeedGbps  float64   `json:"port_speed_gbps"`
+	DiskUsedBytes  uint64    `json:"disk_used_bytes"`
+	DiskTotalBytes uint64    `json:"disk_total_bytes"`
+	DiskPercent    float64   `json:"disk_percent"`
+	DiskReadBps    float64   `json:"disk_read_bps"`
+	DiskWriteBps   float64   `json:"disk_write_bps"`
+	Warnings       int       `json:"warnings"`
+	NeedsScaling   bool      `json:"needs_scaling"`
+}
+
+// publisher wraps a Redis client that may be nil (publishing disabled) —
+// every method is then a no-op, so callers never need to branch on
+// whether publishing is configured.
+type publisher struct {
+	client *redis.Client
+	ttl    time.Duration
+}
+
+func newPublisher(cfg publishConfig, interval time.Duration) *publisher {
+	if cfg.ServerID == "" || cfg.RedisAddr == "" {
+		return &publisher{}
+	}
+
+	ttl := interval * 5
+	if ttl < 15*time.Second {
+		ttl = 15 * time.Second
+	}
+
+	return &publisher{
+		client: redis.NewClient(&redis.Options{
+			Addr:     cfg.RedisAddr,
+			Password: cfg.RedisPassword,
+		}),
+		ttl: ttl,
+	}
+}
+
+// key matches the "vapp:" namespacing convention vapp-api's own Redis
+// usage already documents (internal/presence) — this Redis instance is
+// shared with other apps on the same host/port with no namespacing
+// convention of their own.
+func (p *publisher) key(serverID string) string {
+	return "vapp:livekit:stats:" + serverID
+}
+
+// publish is fire-and-forget: a Redis outage or misconfiguration must
+// never take down box monitoring, so errors are logged and swallowed,
+// same fail-open reasoning as vapp-api's own Redis-backed subsystems.
+func (p *publisher) publish(serverID string, snap snapshot) {
+	if p.client == nil {
+		return
+	}
+
+	data, err := json.Marshal(snap)
+	if err != nil {
+		log.Printf("server-stats: marshal snapshot: %v", err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := p.client.Set(ctx, p.key(serverID), data, p.ttl).Err(); err != nil {
+		log.Printf("server-stats: publish to redis: %v", err)
+	}
+}
+
 func main() {
 	configuredIF, configuredPortSpeed, interval := loadConfig()
 
@@ -373,9 +483,15 @@ func main() {
 
 	portSpeedGbps := detectPortSpeedGbps(iface, configuredPortSpeed)
 
+	pubCfg := loadPublishConfig()
+	pub := newPublisher(pubCfg, interval)
+
 	fmt.Println("LiveKit server monitor")
 	fmt.Println("Network interface:", iface)
 	fmt.Printf("Port speed:       %.2f Gbps\n", portSpeedGbps)
+	if pub.client != nil {
+		fmt.Printf("Publishing to:    %s (server_id=%s)\n", pubCfg.RedisAddr, pubCfg.ServerID)
+	}
 	fmt.Println("Starting...")
 
 	prevIdle, prevTotal := cpuStats()
@@ -510,6 +626,31 @@ func main() {
 		} else if warnings >= 2 {
 			fmt.Println("⚠ Consider adding another LiveKit node")
 		}
+
+		pub.publish(pubCfg.ServerID, snapshot{
+			ServerID:       pubCfg.ServerID,
+			UpdatedAt:      time.Now().UTC(),
+			Interface:      iface,
+			CPUPercent:     cpu,
+			Load1:          load1,
+			Load5:          load5,
+			Load15:         load15,
+			MemUsedBytes:   usedMem,
+			MemTotalBytes:  totalMem,
+			MemPercent:     memPercent,
+			NetInMbps:      rxMbps,
+			NetOutMbps:     txMbps,
+			NetInUtilPct:   rxUtil,
+			NetOutUtilPct:  txUtil,
+			PortSpeedGbps:  portSpeedGbps,
+			DiskUsedBytes:  diskUsed,
+			DiskTotalBytes: diskTotal,
+			DiskPercent:    diskPercent,
+			DiskReadBps:    diskRead,
+			DiskWriteBps:   diskWrite,
+			Warnings:       warnings,
+			NeedsScaling:   warnings >= 2,
+		})
 
 		fmt.Println()
 		fmt.Printf("Refreshing every %s...\n", interval)
